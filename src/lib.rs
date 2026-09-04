@@ -7,8 +7,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::{Arc, mpsc};
+use std::thread;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -315,7 +316,10 @@ impl Process {
                 cmd.stdin(Stdio::piped());
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::piped());
-                ProcessInner::Local(cmd.spawn()?)
+                let child = cmd.spawn()?;
+                // Set stderr to non-blocking
+                change_blocking_fd(child.stderr.as_ref().unwrap().as_raw_fd(), false);
+                ProcessInner::Local(child)
             }
             Computer::Remote { sess, .. } => {
                 // Assemble the command into a single line.
@@ -349,8 +353,8 @@ impl Process {
         if let ProcessInner::Local(child) = &self.inner {
             #[cfg(target_family = "unix")]
             {
+                change_blocking_fd(child.stdin.as_ref().unwrap().as_raw_fd(), blocking);
                 change_blocking_fd(child.stdout.as_ref().unwrap().as_raw_fd(), blocking);
-                change_blocking_fd(child.stderr.as_ref().unwrap().as_raw_fd(), blocking);
             }
             #[cfg(target_family = "windows")]
             {
@@ -584,10 +588,19 @@ impl Process {
         if line.is_some() {
             return Ok(line);
         }
+        // Set stderr to non-blocking
+        match self.inner {
+            ProcessInner::Local(_) => {} // Local process stderr is always non-blocking
+            ProcessInner::Remote(_) => self.set_blocking(false),
+        }
         //
-        self.set_blocking(false);
         let read_result = match &mut self.inner {
-            ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap()),
+            ProcessInner::Local(child) => {
+                let Some(stderr) = child.stderr.as_mut() else {
+                    panic!("stderr was forwarded");
+                };
+                read_nonblocking(stderr)
+            }
             ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
         };
         //
@@ -600,19 +613,31 @@ impl Process {
             Err(err) => {
                 let eof = err.kind() == ErrorKind::BrokenPipe;
                 if eof && !self.stderr_buffer.is_empty() {
+                    // If EOF then return remaining content, even though it's not newline terminated
                     let data = std::mem::take(&mut self.stderr_buffer);
                     let line = Some(String::from_utf8(data.into())?);
-                    return Ok(line);
+                    Ok(line)
+                } else {
+                    Err(err.into())
                 }
-                Err(err.into())
             }
         }
     }
     /// Read all available bytes from the process’s standard error channel.
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
-        self.set_blocking(false);
+        // Set stderr to non-blocking
+        match self.inner {
+            ProcessInner::Local(_) => {} // Local process stderr is always non-blocking
+            ProcessInner::Remote(_) => self.set_blocking(false),
+        }
+        //
         let read_result = match &mut self.inner {
-            ProcessInner::Local(child) => read_nonblocking(child.stderr.as_mut().unwrap()),
+            ProcessInner::Local(child) => {
+                let Some(stderr) = child.stderr.as_mut() else {
+                    panic!("stderr was forwarded");
+                };
+                read_nonblocking(stderr)
+            }
             ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
         };
         match read_result {
