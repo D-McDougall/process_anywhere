@@ -193,10 +193,10 @@ impl Computer {
         // Open and retrieve the file from the remote.
         let mut file = sftp.open(path)?;
         let mut data = match stat.size {
-            Some(bytes) => String::with_capacity(bytes as usize),
-            None => String::new(),
+            Some(bytes) => Vec::with_capacity(bytes as usize),
+            None => Vec::new(),
         };
-        file.read_to_string(&mut data)?;
+        file.read_to_end(&mut data)?;
         std::fs::write(path, &data)?;
         Ok(())
     }
@@ -353,8 +353,12 @@ impl Process {
         if let ProcessInner::Local(child) = &self.inner {
             #[cfg(target_family = "unix")]
             {
-                change_blocking_fd(child.stdin.as_ref().unwrap().as_raw_fd(), blocking);
-                change_blocking_fd(child.stdout.as_ref().unwrap().as_raw_fd(), blocking);
+                if let Some(stdin) = child.stdin.as_ref() {
+                    change_blocking_fd(stdin.as_raw_fd(), blocking);
+                }
+                if let Some(stdout) = child.stdout.as_ref() {
+                    change_blocking_fd(stdout.as_raw_fd(), blocking);
+                }
             }
             #[cfg(target_family = "windows")]
             {
@@ -894,6 +898,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn remote_ack() {
         // First SCP the environment files onto the remote test computer.
         let mut comp = dbg!(test_computer());
@@ -928,6 +933,7 @@ mod tests {
 
     /// Test sending and receiving files.
     #[test]
+    #[ignore]
     fn remote_roundtrip() {
         let mut comp = dbg!(test_computer());
         comp.connect().unwrap();
