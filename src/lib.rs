@@ -104,9 +104,9 @@ impl Computer {
             Self::Remote { .. } => self.connect().unwrap(),
             Self::Local => return Ok(()),
         };
-        self.send_file_inner(&sess, path.as_ref())
+        Self::send_file_inner(&sess, path.as_ref())
     }
-    fn send_file_inner(&self, sess: &Session, path: &Path) -> Result<(), Error> {
+    fn send_file_inner(sess: &Session, path: &Path) -> Result<(), Error> {
         sess.set_blocking(true);
         let sftp = sess.sftp()?;
         // Get the remote files's modification time stamp (in unix time).
@@ -166,9 +166,9 @@ impl Computer {
             Self::Remote { .. } => self.connect().unwrap(),
             Self::Local => return Ok(()),
         };
-        self.recv_file_inner(&sess, path.as_ref())
+        Self::recv_file_inner(&sess, path.as_ref())
     }
-    fn recv_file_inner(&self, sess: &Session, path: &Path) -> Result<(), Error> {
+    fn recv_file_inner(sess: &Session, path: &Path) -> Result<(), Error> {
         // Create the local parent directory if it doesn't already exist
         if let Some(directory) = path.parent() {
             std::fs::create_dir_all(directory)?;
@@ -273,8 +273,8 @@ impl Drop for Computer {
 /// This does not kill or wait for dropped processes to terminate.
 ///
 /// Blocking Behavior:
-///     * Writing to stdin is always blocking
-///         + Immediately flushes to operating system buffer
+///     * Writing to stdin is always blocking, and immediately flushes to
+///       operating system buffer
 ///     * Reading from stderr is always non-blocking
 ///     * Reading from stdout can be either blocking or non-blocking
 ///
@@ -444,6 +444,8 @@ impl Process {
     }
     /// Write to and flush the process’s standard input channel.
     /// This appends a newline (if not already present).
+    ///
+    /// This method blocks until completion
     pub fn send_line(&mut self, message: &str) -> Result<(), Error> {
         if let ProcessInner::Remote(RemoteInner { session, .. }) = &self.inner {
             session.set_blocking(true);
@@ -457,6 +459,8 @@ impl Process {
         Ok(())
     }
     /// Write to and flush the process’s standard input channel.
+    ///
+    /// This method blocks until completion
     pub fn send_bytes(&mut self, message: &[u8]) -> Result<(), Error> {
         if let ProcessInner::Remote(RemoteInner { session, .. }) = &self.inner {
             session.set_blocking(true);
@@ -577,6 +581,9 @@ impl Process {
         retval
     }
     /// Read one line from the process’s standard error channel
+    ///
+    /// This method is non-blocking. Returns [None] if the next line is not
+    /// yet available.
     pub fn error_line(&mut self) -> Result<Option<String>, Error> {
         // First check the local buffer.
         let line = read_line(&mut self.stderr_buffer)?;
@@ -621,6 +628,9 @@ impl Process {
         }
     }
     /// Read all available bytes from the process’s standard error channel
+    ///
+    /// This method is non-blocking. Returns an empty vector if nothing is
+    /// available.
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
         // Set stderr to non-blocking
         match self.inner {
@@ -655,6 +665,8 @@ impl Process {
         }
     }
     /// Close the process’s standard input and output channels
+    ///
+    /// Note: remote processes only close stdin; they do not close stdout
     pub fn close_stdio(&mut self) -> Result<(), Error> {
         match &mut self.inner {
             ProcessInner::Local(child) => {
@@ -669,10 +681,11 @@ impl Process {
         }
         Ok(())
     }
-    /// Close the process’s standard input channel and block until it terminates.
+    /// Close the process’s standard input and output channels and block until
+    /// it terminates
     ///
     /// Returns [true] if the process ended cleanly, or [false] if it was killed
-    /// by a signal or if it exited with non-zero status code.
+    /// by a signal or if it exited with non-zero status code
     pub fn wait(&mut self) -> Result<bool, Error> {
         self.close_stdio()?;
         match &mut self.inner {
@@ -700,6 +713,20 @@ impl Process {
                 Ok(success)
             }
         }
+    }
+    ///
+    pub fn send_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let ProcessInner::Remote(RemoteInner { session, .. }) = &self.inner else {
+            return Ok(());
+        };
+        Computer::send_file_inner(&session, path.as_ref())
+    }
+    ///
+    pub fn recv_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let ProcessInner::Remote(RemoteInner { session, .. }) = &self.inner else {
+            return Ok(());
+        };
+        Computer::recv_file_inner(&session, path.as_ref())
     }
 }
 
@@ -866,6 +893,7 @@ mod tests {
 
     #[test]
     fn eof_line() {
+        // Check it can get the last line before an EOF
         let comp = dbg!(Arc::new(Computer::Local));
         let mut proc = dbg!(comp.exec(&["echo", "one\ntwo\nthree"])).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -875,7 +903,6 @@ mod tests {
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "three");
         assert!(dbg!(proc.recv_line()).is_err());
         assert!(!proc.is_alive().unwrap());
-
         assert!(proc.wait().unwrap());
     }
 
@@ -892,7 +919,7 @@ mod tests {
         assert!(!proc.is_alive().unwrap());
     }
 
-    fn test_computer() -> Computer {
+    fn remote_computer_test_asset() -> Computer {
         Computer::Remote {
             host: String::new(),
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 56, 101)), 1234),
@@ -905,7 +932,7 @@ mod tests {
     #[ignore]
     fn remote_ack() {
         // First SCP the environment files onto the remote test computer.
-        let mut comp = dbg!(test_computer());
+        let mut comp = dbg!(remote_computer_test_asset());
         comp.connect().unwrap();
         let mut proc = dbg!(Arc::new(comp).exec(&["cat".to_string(), "-".to_string()])).unwrap();
         assert!(proc.is_alive().unwrap());
@@ -939,7 +966,7 @@ mod tests {
     #[test]
     #[ignore]
     fn remote_roundtrip() {
-        let mut comp = dbg!(test_computer());
+        let mut comp = dbg!(remote_computer_test_asset());
         comp.connect().unwrap();
         // Make a new local directory.
         let dir_name = PathBuf::from("test_dir");
