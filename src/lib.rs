@@ -1,4 +1,4 @@
-//! Tools for running computer processes locally or remotely via SSH.
+//! Tools for running computer processes locally or remotely via SSH
 
 use ssh2::{Channel, Session, Sftp};
 use std::collections::VecDeque;
@@ -23,105 +23,90 @@ pub enum Error {
     Utf8(#[from] std::string::FromUtf8Error),
 }
 
-/// Token representing a computer and how to access it.
+/// Token representing a computer and how to access it
 #[derive(Clone)]
 pub enum Computer {
-    /// Local host computer.
+    /// Local computer / operating system
     Local,
 
-    /// Remote host computer via the Secure Shell Protocol (SSH).
+    /// Remote computer accessed via Secure Shell Protocol (SSH)
     Remote {
         /// Hostname of the remote computer.
         host: String,
+
+        /// Computer IP address
         addr: SocketAddr,
+
+        /// Login username
         user: String,
+
+        /// User authentication password / key
         auth: String,
-        /// The established SSH connection object.
-        /// One SSH session multiplexes to service multiple remote processes.
-        sess: Option<Session>,
     },
 }
 
 impl Computer {
-    /// Get the computer that is currently running this program.
-    pub fn new_local() -> Self {
-        Self::Local
+    /// Token for the computer / operating system currently running this program
+    pub fn new_local() -> Arc<Self> {
+        Self::Local.into()
     }
-    /// Get a computer remotely over SSH.
-    pub fn new_remote(host: String, user: String, auth: String) -> Result<Self, Error> {
+    /// Token for accessing a computer remotely over SSH
+    pub fn new_remote(host: String, user: String, auth: String) -> Result<Arc<Self>, Error> {
         let addr = host.to_socket_addrs()?.next().unwrap();
         Ok(Self::Remote {
             host,
             addr,
             user,
             auth,
-            sess: None,
-        })
+        }
+        .into())
     }
-    /// Establish an SSH connection to a remote computer.  
-    /// This does nothing on local computers.  
-    pub fn connect(&mut self) -> Result<(), Error> {
-        // Unpack the remote computer's information into local variables.
+    /// Establish an SSH connection to a remote computer
+    fn connect(&self) -> Result<Session, Error> {
+        // Unpack the remote computer's information into local variables
         let Self::Remote {
-            addr,
-            user,
-            auth,
-            sess,
-            ..
+            addr, user, auth, ..
         } = self
         else {
-            return Ok(());
+            unreachable!();
         };
-        // Establish the SSH connection.
-        if sess.is_none() {
-            let tcp = TcpStream::connect(*addr)?;
-            let mut conn = Session::new()?;
-            conn.set_tcp_stream(tcp);
-            conn.handshake()?;
-            conn.userauth_password(user, auth)?;
-            *sess = Some(conn);
-        }
-        self.delete_auth();
-        Ok(())
+        // Establish the SSH connection
+        let tcp = TcpStream::connect(*addr)?;
+        let mut conn = Session::new()?;
+        conn.set_tcp_stream(tcp);
+        conn.handshake()?;
+        conn.userauth_password(user, auth)?;
+        Ok(conn)
     }
-    /// Zero the authentication token / password out of memory.
+    /// Zero the authentication token / password out of memory
     fn delete_auth(&mut self) {
         match self {
             Self::Local => {}
             Self::Remote { auth, .. } => {
-                // Zero all of the string's data.
+                // Zero all of the string's data
                 unsafe {
                     let vec = auth.as_mut_vec();
                     vec.set_len(vec.capacity());
                     vec.fill(0);
                 }
-                auth.clear(); // Zero the size too.
-                *auth = String::new(); // Free the memory allocation.
+                auth.clear(); // Zero the size too
+                *auth = String::new(); // Free the memory allocation
             }
         }
     }
-    /// Returns the externally visible hostname of this computer.
+    /// Returns the externally visible hostname of this computer
     pub fn host(&self) -> String {
         format!("{self}")
     }
-    /// Returns an active session if this is a remote computer, or [None] if
-    /// this is the local computer.
     ///
-    /// Panics if the session has not yet been established.
-    fn get_session(&self) -> Option<&Session> {
-        if let Self::Remote { sess, .. } = self {
-            Some(sess.as_ref().expect("Session not established"))
-        } else {
-            None
-        }
-    }
     pub fn send_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
-        self.send_file_inner(path.as_ref())
-    }
-    fn send_file_inner(&self, path: &Path) -> Result<(), Error> {
-        let Some(sess) = self.get_session() else {
-            return Ok(());
+        let sess = match self {
+            Self::Remote { .. } => self.connect().unwrap(),
+            Self::Local => return Ok(()),
         };
+        self.send_file_inner(&sess, path.as_ref())
+    }
+    fn send_file_inner(&self, sess: &Session, path: &Path) -> Result<(), Error> {
         sess.set_blocking(true);
         let sftp = sess.sftp()?;
         // Get the remote files's modification time stamp (in unix time).
@@ -175,14 +160,16 @@ impl Computer {
         })?;
         Ok(())
     }
+    ///
     pub fn recv_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
-        self.recv_file_inner(path.as_ref())
-    }
-    fn recv_file_inner(&self, path: &Path) -> Result<(), Error> {
-        let Some(sess) = self.get_session() else {
-            return Ok(());
+        let sess = match self {
+            Self::Remote { .. } => self.connect().unwrap(),
+            Self::Local => return Ok(()),
         };
-        // Create the local parent directory if it doesn't already exist.
+        self.recv_file_inner(&sess, path.as_ref())
+    }
+    fn recv_file_inner(&self, sess: &Session, path: &Path) -> Result<(), Error> {
+        // Create the local parent directory if it doesn't already exist
         if let Some(directory) = path.parent() {
             std::fs::create_dir_all(directory)?;
         }
@@ -190,7 +177,7 @@ impl Computer {
         let sftp = sess.sftp()?;
         let stat = sftp.stat(path)?;
         assert!(!stat.is_dir());
-        // Open and retrieve the file from the remote.
+        // Open and retrieve the file from the remote
         let mut file = sftp.open(path)?;
         let mut data = match stat.size {
             Some(bytes) => Vec::with_capacity(bytes as usize),
@@ -200,25 +187,27 @@ impl Computer {
         std::fs::write(path, &data)?;
         Ok(())
     }
-    /// Argument command is the program path followed by its arguments.
+    /// Spawn a new process on this computer
+    ///
+    /// Argument command is the program file-path followed by its CLI arguments
     pub fn exec(self: Arc<Computer>, command: &[impl AsRef<str>]) -> Result<Box<Process>, Error> {
         Process::new(self, command)
     }
 }
 
 fn remote_create_dir_all(sftp: &Sftp, dir: &Path, mode: i32) -> Result<(), Error> {
-    // Base case: check if the directory already exists.
+    // Base case: check if the directory already exists
     match sftp.stat(dir) {
         Ok(stat) => {
             debug_assert!(stat.is_dir());
         }
         Err(err) => match err.code() {
-            // ErrorCode #2 is "file not found" error.
+            // ErrorCode #2 is "file not found" error
             ssh2::ErrorCode::SFTP(2) => {
                 if let Some(parent) = dir.parent() {
-                    // Recursively ensure that the parent directory exists.
+                    // Recursively ensure that the parent directory exists
                     remote_create_dir_all(sftp, parent, mode)?;
-                    // Make the target directory.
+                    // Make the target directory
                     sftp.mkdir(dir, mode)?;
                 }
             }
@@ -252,23 +241,17 @@ impl fmt::Debug for Computer {
                 addr,
                 user,
                 auth,
-                sess,
             } => {
                 let auth = if auth.is_empty() {
-                    format_args!("None")
+                    format_args!("\"\"")
                 } else {
                     format_args!("[hidden]")
-                };
-                let sess = match sess {
-                    None => format_args!("None"),
-                    Some(_) => format_args!("Some(ssh2::Session)"),
                 };
                 fmt.debug_struct("Remote")
                     .field("host", &host)
                     .field("addr", &addr)
                     .field("user", &user)
                     .field("auth", &auth)
-                    .field("sess", &sess)
                     .finish()
             }
         }
@@ -277,17 +260,24 @@ impl fmt::Debug for Computer {
 
 impl Drop for Computer {
     fn drop(&mut self) {
-        self.delete_auth(); // Scrub the password on the way out.
+        self.delete_auth(); // Scrub the password on the way out
     }
 }
 
-/// Container for an active computer process.  
+/// Container for an active computer process
 ///
 /// This provides an API for interacting with computer processes,
 /// regardless of where the computer is located.
 ///
-/// Drop only closes the process’s standard input channel.
-/// This does not wait for or kill processes when dropped.
+/// Drop closes the process’s standard input and output channels.
+/// This does not kill or wait for dropped processes to terminate.
+///
+/// Blocking Behavior:
+///     * Writing to stdin is always blocking
+///         + Immediately flushes to operating system buffer
+///     * Reading from stderr is always non-blocking
+///     * Reading from stdout can be either blocking or non-blocking
+///
 #[derive(Debug)]
 pub struct Process {
     computer: Arc<Computer>,
@@ -295,19 +285,24 @@ pub struct Process {
     stderr_buffer: VecDeque<u8>,
     inner: ProcessInner,
 }
-
 enum ProcessInner {
     Local(Child),
-    Remote(Channel),
+    Remote(RemoteInner),
+}
+struct RemoteInner {
+    session: Session,
+    channel: Channel,
 }
 
 impl Process {
-    /// Argument command is the program path followed by its arguments.
+    /// Spawn a new process on the given computer
+    ///
+    /// Argument command is the program file-path followed by its CLI arguments
     pub fn new(
         computer: Arc<Computer>,
         command: &[impl AsRef<str>],
     ) -> Result<Box<Process>, Error> {
-        assert!(!command.is_empty());
+        assert!(!command.is_empty(), "argument 'command' is empty");
         let inner = match computer.as_ref() {
             Computer::Local => {
                 // Setup the subprocess command.
@@ -321,8 +316,8 @@ impl Process {
                 change_blocking_fd(child.stderr.as_ref().unwrap().as_raw_fd(), false);
                 ProcessInner::Local(child)
             }
-            Computer::Remote { sess, .. } => {
-                // Assemble the command into a single line.
+            Computer::Remote { .. } => {
+                // Assemble the command into a single line
                 let mut line = String::with_capacity(
                     command.iter().map(|arg| arg.as_ref().len()).sum::<usize>() + command.len() - 1,
                 );
@@ -331,13 +326,14 @@ impl Process {
                     line.push(' ');
                     line.push_str(arg.as_ref());
                 }
-                // Run the program on the remote computer.
-                let sess = sess.as_ref().expect("Session not established");
-                sess.set_blocking(true);
-                let mut channel = sess.channel_session()?;
+                // Establish a new connection for this program
+                let session = computer.connect()?;
+                // Run the program on the remote computer
+                session.set_blocking(true);
+                let mut channel = session.channel_session()?;
                 channel.exec(&line)?;
                 //
-                ProcessInner::Remote(channel)
+                ProcessInner::Remote(RemoteInner { session, channel })
             }
         };
         let mut this = Process {
@@ -350,29 +346,29 @@ impl Process {
         Ok(Box::new(this))
     }
     fn set_blocking(&mut self, blocking: bool) {
-        if let ProcessInner::Local(child) = &self.inner {
-            #[cfg(target_family = "unix")]
-            {
-                if let Some(stdin) = child.stdin.as_ref() {
-                    change_blocking_fd(stdin.as_raw_fd(), blocking);
+        match &self.inner {
+            ProcessInner::Local(child) => {
+                #[cfg(target_family = "unix")]
+                {
+                    if let Some(stdin) = child.stdin.as_ref() {
+                        change_blocking_fd(stdin.as_raw_fd(), blocking);
+                    }
+                    if let Some(stdout) = child.stdout.as_ref() {
+                        change_blocking_fd(stdout.as_raw_fd(), blocking);
+                    }
                 }
-                if let Some(stdout) = child.stdout.as_ref() {
-                    change_blocking_fd(stdout.as_raw_fd(), blocking);
+                #[cfg(target_family = "windows")]
+                {
+                    todo!()
                 }
             }
-            #[cfg(target_family = "windows")]
-            {
-                todo!()
+            ProcessInner::Remote(RemoteInner { session, .. }) => {
+                session.set_blocking(blocking);
             }
-        } else if let Some(sess) = self.computer.get_session() {
-            sess.set_blocking(blocking);
-        } else {
-            unreachable!();
         }
     }
     /// Is this process still running or does it have unread messages on stdout or stderr?
     pub fn is_alive(&mut self) -> Result<bool, Error> {
-        dbg!(&self);
         let Self {
             inner,
             stdout_buffer,
@@ -391,42 +387,37 @@ impl Process {
                     return Ok(true);
                 }
                 // Final check for unread messages.
-                let stdout_pipe = child
-                    .stdout
-                    .as_mut()
-                    .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?;
-                match read_nonblocking(stdout_pipe) {
-                    Ok(stdout_data) => {
-                        stdout_buffer.append(&mut stdout_data.into());
-                        return Ok(true);
-                    }
-                    Err(err) => {
-                        // Ignore EOF errors.
-                        if err.kind() != ErrorKind::BrokenPipe {
-                            return Err(err.into());
+                if let Some(stdout_pipe) = child.stdout.as_mut() {
+                    match read_nonblocking(stdout_pipe) {
+                        Ok(stdout_data) => {
+                            stdout_buffer.append(&mut stdout_data.into());
+                            return Ok(true);
+                        }
+                        Err(err) => {
+                            // Ignore EOF errors.
+                            if err.kind() != ErrorKind::BrokenPipe {
+                                return Err(err.into());
+                            }
                         }
                     }
                 }
-                let stderr_pipe = child
-                    .stderr
-                    .as_mut()
-                    .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?;
-                match read_nonblocking(stderr_pipe) {
-                    Ok(stderr_data) => {
-                        stderr_buffer.append(&mut stderr_data.into());
-                        return Ok(true);
-                    }
-                    Err(err) => {
-                        // Ignore EOF errors.
-                        if err.kind() != ErrorKind::BrokenPipe {
-                            return Err(err.into());
+                if let Some(stderr_pipe) = child.stderr.as_mut() {
+                    match read_nonblocking(stderr_pipe) {
+                        Ok(stderr_data) => {
+                            stderr_buffer.append(&mut stderr_data.into());
+                            return Ok(true);
+                        }
+                        Err(err) => {
+                            // Ignore EOF errors.
+                            if err.kind() != ErrorKind::BrokenPipe {
+                                return Err(err.into());
+                            }
                         }
                     }
                 }
-                //
                 Ok(false)
             }
-            ProcessInner::Remote(channel) => Ok(!channel.eof()),
+            ProcessInner::Remote(RemoteInner { channel, .. }) => Ok(!channel.eof()),
         }
     }
     /// Get the computer that this process is running on.
@@ -439,7 +430,7 @@ impl Process {
                 .stdin
                 .as_mut()
                 .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?,
-            ProcessInner::Remote(channel) => channel,
+            ProcessInner::Remote(RemoteInner { channel, .. }) => channel,
         })
     }
     fn stdout(&mut self) -> Result<&mut dyn Read, Error> {
@@ -448,14 +439,14 @@ impl Process {
                 .stdout
                 .as_mut()
                 .ok_or(Error::Io(ErrorKind::BrokenPipe.into()))?,
-            ProcessInner::Remote(channel) => channel,
+            ProcessInner::Remote(RemoteInner { channel, .. }) => channel,
         })
     }
     /// Write to and flush the process’s standard input channel.
     /// This appends a newline (if not already present).
     pub fn send_line(&mut self, message: &str) -> Result<(), Error> {
-        if let Some(sess) = self.computer.get_session() {
-            sess.set_blocking(true);
+        if let ProcessInner::Remote(RemoteInner { session, .. }) = &self.inner {
+            session.set_blocking(true);
         }
         let stdin = self.stdin()?;
         stdin.write_all(message.as_bytes())?;
@@ -467,8 +458,8 @@ impl Process {
     }
     /// Write to and flush the process’s standard input channel.
     pub fn send_bytes(&mut self, message: &[u8]) -> Result<(), Error> {
-        if let Some(sess) = self.computer.get_session() {
-            sess.set_blocking(true);
+        if let ProcessInner::Remote(RemoteInner { session, .. }) = &self.inner {
+            session.set_blocking(true);
         }
         let stdin = self.stdin()?;
         stdin.write_all(message)?;
@@ -507,7 +498,7 @@ impl Process {
         }
     }
     /// Read an exact number of bytes from the process’s standard output channel,
-    /// or returns [None] if the data is not yet available.
+    /// or returns [None] if the data is not yet available
     pub fn recv_bytes(&mut self, bytes: usize) -> Result<Option<Box<[u8]>>, Error> {
         // First check the local buffer.
         if self.stdout_buffer.len() >= bytes {
@@ -562,7 +553,7 @@ impl Process {
         retval
     }
     /// Read an exact number of bytes from the process’s standard output
-    /// channel, blocking until the data arrives.
+    /// channel, blocking until the data arrives
     pub fn block_bytes(&mut self, bytes: usize) -> Result<Box<[u8]>, Error> {
         // First check the local buffer.
         if self.stdout_buffer.len() >= bytes {
@@ -585,7 +576,7 @@ impl Process {
         self.stdout_buffer = stdout_buffer;
         retval
     }
-    /// Read one line from the process’s standard error channel.
+    /// Read one line from the process’s standard error channel
     pub fn error_line(&mut self) -> Result<Option<String>, Error> {
         // First check the local buffer.
         let line = read_line(&mut self.stderr_buffer)?;
@@ -605,7 +596,9 @@ impl Process {
                 };
                 read_nonblocking(stderr)
             }
-            ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
+            ProcessInner::Remote(RemoteInner { channel, .. }) => {
+                read_nonblocking(&mut channel.stderr())
+            }
         };
         //
         match read_result {
@@ -627,7 +620,7 @@ impl Process {
             }
         }
     }
-    /// Read all available bytes from the process’s standard error channel.
+    /// Read all available bytes from the process’s standard error channel
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
         // Set stderr to non-blocking
         match self.inner {
@@ -642,7 +635,9 @@ impl Process {
                 };
                 read_nonblocking(stderr)
             }
-            ProcessInner::Remote(channel) => read_nonblocking(&mut channel.stderr()),
+            ProcessInner::Remote(RemoteInner { channel, .. }) => {
+                read_nonblocking(&mut channel.stderr())
+            }
         };
         match read_result {
             Ok(data) => {
@@ -659,18 +654,16 @@ impl Process {
             }
         }
     }
-    /// Close the process’s standard input channel.
-    pub fn close_stdin(&mut self) -> Result<(), Error> {
+    /// Close the process’s standard input and output channels
+    pub fn close_stdio(&mut self) -> Result<(), Error> {
         match &mut self.inner {
             ProcessInner::Local(child) => {
-                if let Some(mut pipe) = child.stdin.take() {
-                    pipe.flush()?;
-                }
+                child.stdin.take();
+                child.stdout.take();
             }
-            ProcessInner::Remote(channel) => {
+            ProcessInner::Remote(RemoteInner { session, channel }) => {
                 // Block so that it can flush the buffer.
-                let sess = self.computer.get_session().unwrap();
-                sess.set_blocking(true);
+                session.set_blocking(true);
                 channel.send_eof()?;
             }
         }
@@ -681,6 +674,7 @@ impl Process {
     /// Returns [true] if the process ended cleanly, or [false] if it was killed
     /// by a signal or if it exited with non-zero status code.
     pub fn wait(&mut self) -> Result<bool, Error> {
+        self.close_stdio()?;
         match &mut self.inner {
             ProcessInner::Local(child) => {
                 if let Some(mut pipe) = child.stdin.take() {
@@ -689,10 +683,9 @@ impl Process {
                 let status = child.wait()?;
                 Ok(status.success())
             }
-            ProcessInner::Remote(channel) => {
+            ProcessInner::Remote(RemoteInner { session, channel }) => {
                 //
-                let sess = self.computer.get_session().unwrap();
-                sess.set_blocking(true);
+                session.set_blocking(true);
                 channel.close()?;
                 channel.wait_eof()?; // required to complete before calling wait_close
                 channel.wait_close()?;
@@ -712,7 +705,7 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let _error = self.close_stdin();
+        let _error = self.close_stdio();
     }
 }
 
@@ -813,7 +806,6 @@ mod tests {
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234),
             user: "unit_test".to_string(),
             auth: "Z".to_string(),
-            sess: None,
         };
 
         let debug = format!("{comp1:?}\n{comp2:?}");
@@ -875,9 +867,7 @@ mod tests {
     #[test]
     fn eof_line() {
         let comp = dbg!(Arc::new(Computer::Local));
-        let mut proc = dbg!(comp.exec(&["cat", "-"])).unwrap();
-        proc.send_bytes(b"one\ntwo\nthree").unwrap();
-        proc.close_stdin().unwrap();
+        let mut proc = dbg!(comp.exec(&["echo", "one\ntwo\nthree"])).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "one");
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "two");
@@ -893,7 +883,6 @@ mod tests {
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 56, 101)), 1234),
             user: "vboxuser".to_string(),
             auth: "testasset321".to_string(),
-            sess: None,
         }
     }
 
@@ -925,7 +914,7 @@ mod tests {
 
         assert!(proc.error_bytes().unwrap().is_empty());
         assert!(proc.is_alive().unwrap());
-        proc.close_stdin().unwrap();
+        proc.close_stdio().unwrap();
         assert!(proc.is_alive().unwrap());
         assert!(proc.wait().unwrap());
         assert!(!proc.is_alive().unwrap());
