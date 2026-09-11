@@ -871,10 +871,25 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "one");
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "two");
+        assert!(proc.is_alive().unwrap());
         assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "three");
         assert!(dbg!(proc.recv_line()).is_err());
+        assert!(!proc.is_alive().unwrap());
 
         assert!(proc.wait().unwrap());
+    }
+
+    #[test]
+    fn is_alive() {
+        let comp = dbg!(Arc::new(Computer::Local));
+        let mut proc = dbg!(comp.exec(&["sleep", ".3"])).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(proc.is_alive().unwrap());
+        proc.close_stdio().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(proc.is_alive().unwrap());
+        proc.wait().unwrap();
+        assert!(!proc.is_alive().unwrap());
     }
 
     fn test_computer() -> Computer {
