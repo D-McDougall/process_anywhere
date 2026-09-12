@@ -1,6 +1,6 @@
 //! Tools for running computer processes locally or remotely via SSH
 
-use ssh2::{Channel, Session, Sftp};
+use ssh2::{Channel, Session, Sftp, Stream};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, ChildStderr, Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, mpsc, mpsc::TryRecvError};
 use std::thread;
 
 #[derive(thiserror::Error, Debug)]
@@ -269,14 +269,25 @@ impl Drop for Computer {
 /// This provides an API for interacting with computer processes,
 /// regardless of where the computer is located.
 ///
+/// ## Line Buffers
+/// Lines are terminated by either newline characters ('\n') or the end of
+/// file. Carriage return characters ('\r') are treated as regular text.
+///
+/// Methods that send lines ensure that a newline is present, and will append
+/// the newline character '\n' if necessary.
+///
+/// Methods that receive lines remove the newline character from the end of
+/// each line.
+///
+/// ## Drop
 /// Drop closes the process’s standard input and output channels.
 /// This does not kill or wait for dropped processes to terminate.
 ///
-/// Blocking Behavior:
-///     * Writing to stdin is always blocking, and immediately flushes to
-///       operating system buffer
-///     * Reading from stderr is always non-blocking
-///     * Reading from stdout can be either blocking or non-blocking
+/// ## Blocking Behavior
+///  * Writing to stdin is always blocking, and immediately flushes to
+///    operating system buffer
+///  * Reading from stderr is always non-blocking
+///  * Reading from stdout can be either blocking or non-blocking
 ///
 #[derive(Debug)]
 pub struct Process {
@@ -481,10 +492,7 @@ impl Process {
         }
         //
         self.set_blocking(false);
-        let stdout = self.stdout()?;
-        let read_result = read_nonblocking(stdout);
-        //
-        match read_result {
+        match read_nonblocking(self.stdout()?) {
             Ok(data) => {
                 self.stdout_buffer.append(&mut data.into());
                 let line = read_line(&mut self.stdout_buffer)?;
@@ -510,8 +518,7 @@ impl Process {
         }
         //
         self.set_blocking(false);
-        let stdout = self.stdout()?;
-        let chunk = read_nonblocking(stdout)?;
+        let chunk = read_nonblocking(self.stdout()?)?;
         self.stdout_buffer.append(&mut chunk.into());
         if self.stdout_buffer.len() >= bytes {
             Ok(Some(self.stdout_buffer.drain(..bytes).collect()))
@@ -580,7 +587,8 @@ impl Process {
         self.stdout_buffer = stdout_buffer;
         retval
     }
-    /// Read one line from the process’s standard error channel
+    /// Read one line from the process’s standard error channel. This removes
+    /// the trailing newline.
     ///
     /// This method is non-blocking. Returns [None] if the next line is not
     /// yet available.
@@ -595,22 +603,8 @@ impl Process {
             ProcessInner::Local(_) => {} // Local process stderr is always non-blocking
             ProcessInner::Remote(_) => self.set_blocking(false),
         }
-        //
-        let read_result = match &mut self.inner {
-            ProcessInner::Local(child) => {
-                let Some(stderr) = child.stderr.as_mut() else {
-                    panic!("stderr was forwarded");
-                };
-                read_nonblocking(stderr)
-            }
-            ProcessInner::Remote(RemoteInner { channel, .. }) => {
-                read_nonblocking(&mut channel.stderr())
-            }
-        };
-        //
-        match read_result {
-            Ok(data) => {
-                self.stderr_buffer.append(&mut data.into());
+        match self.read_stderr() {
+            Ok(()) => {
                 let line = read_line(&mut self.stderr_buffer)?;
                 Ok(line)
             }
@@ -637,23 +631,8 @@ impl Process {
             ProcessInner::Local(_) => {} // Local process stderr is always non-blocking
             ProcessInner::Remote(_) => self.set_blocking(false),
         }
-        //
-        let read_result = match &mut self.inner {
-            ProcessInner::Local(child) => {
-                let Some(stderr) = child.stderr.as_mut() else {
-                    panic!("stderr was forwarded");
-                };
-                read_nonblocking(stderr)
-            }
-            ProcessInner::Remote(RemoteInner { channel, .. }) => {
-                read_nonblocking(&mut channel.stderr())
-            }
-        };
-        match read_result {
-            Ok(data) => {
-                self.stderr_buffer.append(&mut data.into());
-                Ok(self.stderr_buffer.drain(..).collect())
-            }
+        match self.read_stderr() {
+            Ok(()) => Ok(self.stderr_buffer.drain(..).collect()),
             Err(err) => {
                 let eof = err.kind() == ErrorKind::BrokenPipe;
                 if eof && !self.stderr_buffer.is_empty() {
@@ -663,6 +642,21 @@ impl Process {
                 Err(err.into())
             }
         }
+    }
+    fn read_stderr(&mut self) -> Result<(), std::io::Error> {
+        let data = match &mut self.inner {
+            ProcessInner::Local(child) => {
+                let Some(stderr) = child.stderr.as_mut() else {
+                    panic!("stderr was forwarded");
+                };
+                read_nonblocking(stderr)?
+            }
+            ProcessInner::Remote(RemoteInner { channel, .. }) => {
+                read_nonblocking(&mut channel.stderr())?
+            }
+        };
+        self.stderr_buffer.append(&mut data.into());
+        Ok(())
     }
     /// Close the process’s standard input and output channels
     ///
@@ -681,8 +675,8 @@ impl Process {
         }
         Ok(())
     }
-    /// Close the process’s standard input and output channels and block until
-    /// it terminates
+    /// Close the process’s standard input and output channels, send the close
+    /// message / kill signal, and block until it terminates
     ///
     /// Returns [true] if the process ended cleanly, or [false] if it was killed
     /// by a signal or if it exited with non-zero status code
@@ -690,9 +684,9 @@ impl Process {
         self.close_stdio()?;
         match &mut self.inner {
             ProcessInner::Local(child) => {
-                if let Some(mut pipe) = child.stdin.take() {
-                    pipe.flush()?;
-                }
+                // TODO: Either local should kill, or remote should not-kill
+                // TODO: Maybe I could support both kill & wait?
+                // child.kill()?;
                 let status = child.wait()?;
                 Ok(status.success())
             }
