@@ -123,7 +123,7 @@ impl Computer {
     ///
     pub fn send_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
         let sess = match self {
-            Self::Remote { .. } => self.connect().unwrap(),
+            Self::Remote { .. } => self.connect()?,
             Self::Local => return Ok(()),
         };
         Self::send_file_inner(&sess, path.as_ref())
@@ -271,14 +271,29 @@ impl Drop for Computer {
     }
 }
 
+impl Error {
+    fn eof(&self) -> bool {
+        match self {
+            Self::Io(error) => {
+                matches!(
+                    error.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+                )
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Container for an active computer process
 ///
 /// This provides an API for interacting with computer processes,
 /// regardless of where the computer is located.
 ///
 /// ## Newlines
-/// Lines are terminated by either the newline character '\n' or the end of
-/// file. Carriage return characters '\r' are treated as regular text.
+/// Lines are terminated by the newline character '\n'. Carriage return
+/// characters '\r' are treated as regular text. The end-of-file is also
+/// considered a line termination, unless it is forms an empty line.
 ///
 /// Methods that send lines ensure that a newline is present, and will append
 /// the newline character '\n' if necessary.
@@ -305,6 +320,7 @@ pub struct Process {
     stderr_buffer: VecDeque<u8>,
     inner: ProcessInner,
 }
+#[derive(Debug)]
 enum ProcessInner {
     Local(Child),
     Remote(RemoteInner),
@@ -341,13 +357,13 @@ impl Process {
             Computer::Remote { .. } => {
                 // Assemble the command into a single line
                 let mut line = String::with_capacity(
-                    command.iter().map(|arg| arg.as_ref().len()).sum::<usize>() + command.len() - 1,
+                    command.iter().map(|arg| arg.as_ref().len()).sum::<usize>() + command.len(),
                 );
-                line.push_str(command[0].as_ref());
-                for arg in &command[1..] {
+                for string in command {
+                    line.push_str(&shell_escape::unix::escape(string.as_ref().into()));
                     line.push(' ');
-                    line.push_str(arg.as_ref());
                 }
+                line.pop();
                 // Establish a new connection for this program
                 let session = computer.connect()?;
                 let mut channel = session.channel_session()?;
@@ -407,7 +423,6 @@ impl Process {
                 // Process dead & channels EOF, drop them
                 mem::take(&mut child.stdin);
                 mem::take(&mut child.stdout);
-                mem::take(&mut child.stderr);
                 //
                 Ok(!stdout_buffer.is_empty() || !stderr_buffer.is_empty())
             }
@@ -435,18 +450,18 @@ impl Process {
         }
         Ok(())
     }
-    /// Close the process’s standard input and output channels, send the close
-    /// message / kill signal, and block until it terminates
+    /// **Block** until process terminates
     ///
     /// Returns [true] if the process ended cleanly, or [false] if it was killed
     /// by a signal or if it exited with non-zero status code
     pub fn wait(&mut self) -> Result<bool, Error> {
-        self.close_stdio()?;
+        // Empty the pipes to prevent deadlock
+        // let _ = self.read_stdout_nonblocking();
+        // let _ = self.read_stderr_nonblocking();
+        // self.close_stdio()?;
+        //
         match &mut self.inner {
             ProcessInner::Local(child) => {
-                // TODO: Either local should kill, or remote should not-kill
-                // TODO: Maybe I could support both kill & wait?
-                // child.kill()?;
                 let status = child.wait()?;
                 Ok(status.success())
             }
@@ -456,8 +471,9 @@ impl Process {
                 ..
             }) => {
                 let _guard = guard_session_blocking(nonblocking);
-                channel.close()?;
+                channel.send_eof()?;
                 channel.wait_eof()?; // required to complete before calling wait_close
+                channel.close()?;
                 channel.wait_close()?;
                 //
                 let signal = channel.exit_signal()?;
@@ -570,23 +586,16 @@ impl Process {
         if line.is_some() {
             return Ok(line);
         }
-        // Read stdout non-blocking
-        self.set_stdout_blocking(false);
-        let read_result = read_nonblocking(self.stdout()?);
-        self.set_stdout_blocking(true);
-        match read_result {
-            Ok(data) => {
-                self.stdout_buffer.append(&mut data.into());
-                read_line(&mut self.stdout_buffer)
-            }
-            Err(err) => {
+        // Get another batch of data and check for newline again
+        match self.read_stdout_nonblocking() {
+            Ok(()) => read_line(&mut self.stdout_buffer),
+            Err(error) => {
                 // If EOF then return all remaining data in buffer
-                let eof = err.kind() == ErrorKind::BrokenPipe;
-                if eof && !self.stdout_buffer.is_empty() {
+                if error.eof() && !self.stdout_buffer.is_empty() {
                     let data = mem::take(&mut self.stdout_buffer);
                     Ok(Some(String::from_utf8(data.into())?))
                 } else {
-                    Err(err.into())
+                    Err(error)
                 }
             }
         }
@@ -600,16 +609,21 @@ impl Process {
             return Ok(Some(self.stdout_buffer.drain(..bytes).collect()));
         }
         // Read stdout non-blocking
-        self.set_stdout_blocking(false);
-        let chunk = read_nonblocking(self.stdout()?)?;
-        self.set_stdout_blocking(true);
-        self.stdout_buffer.append(&mut chunk.into());
+        self.read_stdout_nonblocking()?;
         // Check if enough data is now available
         if self.stdout_buffer.len() >= bytes {
             Ok(Some(self.stdout_buffer.drain(..bytes).collect()))
         } else {
             Ok(None)
         }
+    }
+    /// Manages blocking/non-blocking behavior
+    fn read_stdout_nonblocking(&mut self) -> Result<(), Error> {
+        self.set_stdout_blocking(false);
+        let chunk = self.stdout().and_then(read_nonblocking);
+        self.set_stdout_blocking(true);
+        self.stdout_buffer.append(&mut chunk?.into());
+        Ok(())
     }
     /// Read one line from the process’s standard output channel.
     /// Then this removes the trailing newline.
@@ -631,7 +645,11 @@ impl Process {
                 Ok(num) => {
                     // Check for end of file, return all remaining data
                     if num == 0 {
-                        return Ok(String::from_utf8(stdout_buffer.into())?);
+                        if stdout_buffer.is_empty() {
+                            break Err(Error::Io(ErrorKind::BrokenPipe.into()));
+                        } else {
+                            break Ok(String::from_utf8(stdout_buffer.into())?);
+                        }
                     }
                     stdout_buffer.extend(&read_buffer[..num]);
                 }
@@ -639,18 +657,17 @@ impl Process {
                     // Check for end of file, return all remaining data
                     if err.kind() == ErrorKind::BrokenPipe && !stdout_buffer.is_empty() {
                         // Return all remaining data
-                        return Ok(String::from_utf8(stdout_buffer.into())?);
+                        break Ok(String::from_utf8(stdout_buffer.into())?);
                     }
-                    return Err(err.into());
+                    break Err(err.into());
                 }
             }
             // Check for newline
             if let Some(line) = read_line(&mut stdout_buffer)? {
                 self.stdout_buffer = stdout_buffer; // Save remaining data in buffer
-                return Ok(line);
+                break Ok(line);
             }
         }
-        unreachable!()
     }
     /// Read an exact number of bytes from the process’s standard output channel
     ///
@@ -683,19 +700,15 @@ impl Process {
             return Ok(line);
         }
         match self.read_stderr_nonblocking() {
-            Ok(()) => {
-                let line = read_line(&mut self.stderr_buffer)?;
-                Ok(line)
-            }
-            Err(err) => {
-                let eof = err.kind() == ErrorKind::BrokenPipe;
-                if eof && !self.stderr_buffer.is_empty() {
-                    // If EOF then return remaining content, even though it's not newline terminated
+            Ok(()) => read_line(&mut self.stderr_buffer),
+            Err(error) => {
+                // If EOF then return remaining content, even though it's not newline terminated
+                if error.eof() && !self.stderr_buffer.is_empty() {
                     let data = mem::take(&mut self.stderr_buffer);
                     let line = Some(String::from_utf8(data.into())?);
                     Ok(line)
                 } else {
-                    Err(err.into())
+                    Err(error)
                 }
             }
         }
@@ -706,21 +719,20 @@ impl Process {
     pub fn error_bytes(&mut self) -> Result<Vec<u8>, Error> {
         match self.read_stderr_nonblocking() {
             Ok(()) => Ok(self.stderr_buffer.drain(..).collect()),
-            Err(err) => {
-                let eof = err.kind() == ErrorKind::BrokenPipe;
-                if eof && !self.stderr_buffer.is_empty() {
+            Err(error) => {
+                if error.eof() && !self.stderr_buffer.is_empty() {
                     let data = mem::take(&mut self.stderr_buffer);
                     return Ok(data.into());
                 }
-                Err(err.into())
+                Err(error)
             }
         }
     }
-    fn read_stderr_nonblocking(&mut self) -> Result<(), io::Error> {
+    fn read_stderr_nonblocking(&mut self) -> Result<(), Error> {
         let data = match &mut self.inner {
             ProcessInner::Local(child) => {
                 let Some(stderr) = child.stderr.as_mut() else {
-                    panic!("stderr was forwarded");
+                    return Ok(()); // stderr was forwarded
                 };
                 // Local process stderr is always non-blocking
                 read_nonblocking(stderr)?
@@ -732,9 +744,9 @@ impl Process {
                 ..
             }) => {
                 set_session_nonblocking(session, nonblocking);
-                let data = read_nonblocking(&mut channel.stderr())?;
+                let data = read_nonblocking(&mut channel.stderr());
                 set_session_blocking(session, nonblocking);
-                data
+                data?
             }
         };
         self.stderr_buffer.append(&mut data.into());
@@ -762,15 +774,14 @@ impl Drop for Process {
     }
 }
 
-impl fmt::Debug for ProcessInner {
+impl fmt::Debug for RemoteInner {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Local(child) => fmt.debug_tuple("Local").field(child).finish(),
-            Self::Remote(_channel) => fmt
-                .debug_tuple("Remote")
-                .field(&format_args!("ssh2::Channel"))
-                .finish(),
-        }
+        let RemoteInner { nonblocking, .. } = self;
+        fmt.debug_struct("RemoteInner")
+            .field("session", &format_args!("ssh2::Session"))
+            .field("channel", &format_args!("ssh2::Channel"))
+            .field("nonblocking", nonblocking)
+            .finish()
     }
 }
 
@@ -809,7 +820,7 @@ fn new_buffer() -> Vec<u8> {
 }
 
 /// Reads all available data until either EOF or WouldBlock
-fn read_nonblocking(pipe: &mut dyn Read) -> io::Result<Vec<u8>> {
+fn read_nonblocking(pipe: &mut dyn Read) -> Result<Vec<u8>, Error> {
     let mut len = 0;
     let mut buffer = vec![];
     loop {
@@ -821,7 +832,8 @@ fn read_nonblocking(pipe: &mut dyn Read) -> io::Result<Vec<u8>> {
             Ok(num) => {
                 len += num;
                 if len == 0 {
-                    return Err(ErrorKind::BrokenPipe.into());
+                    let error: io::Error = ErrorKind::BrokenPipe.into();
+                    return Err(error.into());
                 } else if len < buffer.len() {
                     unsafe {
                         buffer.set_len(len);
@@ -832,14 +844,14 @@ fn read_nonblocking(pipe: &mut dyn Read) -> io::Result<Vec<u8>> {
                     // Pipe.read() filled the buffer. Loop and retry with larger buffer
                 }
             }
-            Err(err) => {
-                match err.kind() {
+            Err(error) => {
+                match error.kind() {
                     ErrorKind::WouldBlock => {
                         unsafe { buffer.set_len(len) };
                         return Ok(buffer);
                     }
                     _ => {
-                        return Err(err);
+                        return Err(error.into());
                     }
                 };
             }
@@ -901,13 +913,13 @@ fn set_session_blocking(session: &Session, nonblocking: &Mutex<u8>) {
 /// Ensures that SSH session is and remains in blocking mode
 fn guard_session_blocking(nonblocking: &Mutex<u8>) -> MutexGuard<'_, u8> {
     loop {
-        {
-            let inner = nonblocking.lock().unwrap();
-            if *inner == 0 {
-                return inner;
-            }
+        let inner = nonblocking.lock().unwrap();
+        if *inner == 0 {
+            break inner;
+        } else {
+            mem::drop(inner);
+            thread::yield_now();
         }
-        thread::yield_now();
     }
 }
 
@@ -979,20 +991,15 @@ impl Forwarder {
                 match source {
                     StderrMessage::Local(stderr) => loop {
                         match stderr.read(&mut buffer) {
-                            Ok(size) => {
-                                // Check for end of file
-                                if size == 0 {
-                                    dead.push(index); // Mark this source for removal
-                                    break;
-                                }
+                            Ok(size) if size > 0 => {
                                 destination.write_all(&buffer[..size]).unwrap();
                             }
-                            Err(error) => {
-                                if error.kind() == ErrorKind::WouldBlock {
-                                    break;
-                                } else {
-                                    panic!("{}", error);
-                                }
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                                break;
+                            }
+                            _ => {
+                                dead.push(index); // Mark this source for removal
+                                break;
                             }
                         }
                     },
@@ -1003,11 +1010,17 @@ impl Forwarder {
                     } => {
                         set_session_nonblocking(session, nonblocking);
                         loop {
-                            let size = stderr.read(&mut buffer).unwrap();
-                            if size > 0 {
-                                destination.write_all(&buffer[..size]).unwrap();
-                            } else {
-                                break;
+                            match stderr.read(&mut buffer) {
+                                Ok(size) if size > 0 => {
+                                    destination.write_all(&buffer[..size]).unwrap();
+                                }
+                                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                _ => {
+                                    dead.push(index); // Mark this source for removal
+                                    break;
+                                }
                             }
                         }
                         set_session_blocking(session, nonblocking);
@@ -1025,21 +1038,34 @@ impl Forwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env::temp_dir;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::path::PathBuf;
-    use std::sync::Once;
+    use std::sync::OnceLock;
 
-    fn remote_computer_test_asset() -> (Child, Computer) {
-        let (server, port) = sshd();
-        let keys = SshKeyFiles::new();
-        let comp = Computer::Remote {
-            host: String::new(),
-            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
-            user: "dm".to_string(),
-            auth: keys.client_private.into_os_string().into_string().unwrap(),
-        };
-        (server, comp)
+    /// Every test is evaluated on every computer
+    fn computer_test_assets() -> Vec<Arc<Computer>> {
+        vec![Computer::new_local(), remote_publickey_computer()]
     }
+
+    /// Start an SSH server using public-key authentication
+    fn remote_publickey_computer() -> Arc<Computer> {
+        let (_server, computer) = PUBLICKEY_SERVER.get_or_init(|| {
+            let mut keys = SshKeyFiles::new();
+            keys.generate();
+            let (server, port) = spawn_sshd_publickey_remote(&keys);
+            let computer = Arc::new(Computer::Remote {
+                host: String::new(),
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+                user: "dm".to_string(),
+                auth: keys.client_private.into_os_string().into_string().unwrap(),
+            });
+            (server, computer)
+        });
+        computer.clone()
+    }
+    /// Keep the child (ssh-server) alive until end of program
+    static PUBLICKEY_SERVER: OnceLock<(Child, Arc<Computer>)> = OnceLock::new();
 
     struct SshKeyFiles {
         base_dir: PathBuf,
@@ -1050,7 +1076,7 @@ mod tests {
     }
     impl SshKeyFiles {
         fn new() -> Self {
-            let base_dir = std::env::temp_dir().join("test_server");
+            let base_dir = temp_dir().join("process_anywhere_test");
             if !base_dir.exists() {
                 fs::create_dir(&base_dir).unwrap();
             }
@@ -1062,20 +1088,19 @@ mod tests {
                 base_dir,
             }
         }
-    }
-
-    #[cfg(target_family = "unix")]
-    static INIT_KEY: Once = Once::new();
-    fn init_ssh_keys() {
-        INIT_KEY.call_once(|| {
-            let keys = SshKeyFiles::new();
-            if keys.server_private.exists() {
-                fs::remove_file(&keys.server_private).unwrap();
-                fs::remove_file(&keys.server_public).unwrap();
-                fs::remove_file(&keys.client_private).unwrap();
-                fs::remove_file(&keys.client_public).unwrap();
+        /// Remove all encryption key files
+        fn delete(&mut self) {
+            if self.server_private.exists() {
+                fs::remove_file(&self.server_private).unwrap();
+                fs::remove_file(&self.server_public).unwrap();
+                fs::remove_file(&self.client_private).unwrap();
+                fs::remove_file(&self.client_public).unwrap();
             }
-            for path in [&keys.server_private, &keys.client_private] {
+        }
+        /// Create new encryption keys
+        fn generate(&mut self) {
+            self.delete();
+            for path in [&self.server_private, &self.client_private] {
                 Command::new("ssh-keygen")
                     .args([
                         "-t",
@@ -1088,19 +1113,20 @@ mod tests {
                     .status()
                     .unwrap();
             }
-        });
+        }
     }
 
-    #[cfg(target_family = "unix")]
-    fn sshd() -> (Child, u16) {
-        // Setup new SSH keys
-        init_ssh_keys();
-        let keys = SshKeyFiles::new();
-        // Get a free port
+    /// Get an unused port number from the OS
+    fn get_free_port() -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// Spawn the SSH server process
+    #[cfg(target_family = "unix")]
+    fn spawn_sshd_publickey_remote(keys: &SshKeyFiles) -> (Child, u16) {
+        let port = get_free_port();
         let port_string = port.to_string();
-        mem::drop(listener);
         // Authorize the clients by public key
         let authorized_keys = keys.client_public.with_file_name("authorized_keys");
         let public_key = fs::read(&keys.client_public).unwrap();
@@ -1162,122 +1188,134 @@ Subsystem sftp internal-sftp
     }
 
     #[test]
-    fn local_ack() {
-        let comp = dbg!(Arc::new(Computer::Local));
-        let mut proc = dbg!(comp.exec(&["cat", "-"])).unwrap();
-        assert!(proc.is_alive().unwrap());
+    fn echo_server() {
+        for comp in computer_test_assets() {
+            dbg!(&comp);
+            let mut proc = dbg!(comp.exec(&["cat", "-"]).unwrap());
+            assert!(proc.is_alive().unwrap());
 
-        // No data yet, should instantly yield (non-blocking).
-        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
+            // No data yet, should instantly yield (non-blocking).
+            assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
-        // Send a message. Environment should echo it back to stdout.
-        proc.send_line("Hello localhost").unwrap();
-        thread::sleep(time::Duration::from_millis(100));
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello localhost");
+            // Send a message. Process should echo it back to stdout.
+            proc.send_line("Hello World!").unwrap();
+            thread::sleep(time::Duration::from_millis(100));
+            assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello World!");
 
-        // Message consumed, no further messages.
-        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
+            // Message consumed, no further messages.
+            assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
-        assert!(proc.error_bytes().unwrap().is_empty());
-        assert!(proc.wait().unwrap());
+            // Test newline handling
+            proc.send_line("Hello\n\n \nlocalhost\n").unwrap();
+            thread::sleep(time::Duration::from_millis(100));
+            assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "Hello");
+            assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "");
+            assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), " ");
+            assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "localhost");
+            assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
 
-        assert!(!proc.is_alive().unwrap());
+            // Test shutdown procedure
+            assert!(proc.error_bytes().unwrap().is_empty());
+            assert!(proc.is_alive().unwrap());
+            assert!(proc.wait().unwrap());
+            assert!(!proc.is_alive().unwrap());
+        }
     }
 
     #[test]
     fn error_line() {
-        let comp = dbg!(Arc::new(Computer::Local));
-        let mut proc = dbg!(comp.exec(&["cat", "foobar"])).unwrap();
-        thread::sleep(time::Duration::from_millis(100));
-        assert!(proc.is_alive().unwrap());
-        assert!(proc.recv_line().is_err());
-        assert!(dbg!(proc.error_line()).unwrap().is_some());
-        assert!(!proc.wait().unwrap());
-        assert!(!proc.is_alive().unwrap());
+        for comp in computer_test_assets() {
+            dbg!(&comp);
+            let mut proc = dbg!(
+                comp.exec(&[
+                    "python3",
+                    "-c",
+                    "import sys
+print('test error_line', file=sys.stderr)
+# sys.stdin.close()
+# sys.stdout.close()
+exit(1)"
+                ])
+                .unwrap()
+            );
+            thread::sleep(time::Duration::from_millis(500));
+            // Check process is kept "alive" by buffered & uncollected data
+            assert!(proc.is_alive().unwrap());
+            dbg!();
+            assert!(proc.recv_line().is_err());
+            dbg!();
+            assert!(proc.recv_bytes(1).is_err());
+            dbg!();
+            assert!(dbg!(proc.block_line()).is_err());
+            assert!(dbg!(proc.block_bytes(1)).is_err());
+            let line = dbg!(proc.error_line().unwrap()).unwrap();
+            assert_eq!(line, "test error_line");
+            assert!(proc.error_line().is_err());
+            assert!(proc.error_bytes().is_err());
+            for _ in 0..3 {
+                assert!(!proc.is_alive().unwrap());
+                assert!(!proc.wait().unwrap());
+            }
+        }
     }
 
-    #[test]
-    fn new_lines() {
-        let comp = dbg!(Arc::new(Computer::Local));
-        let mut proc = dbg!(comp.exec(&["cat", "-"])).unwrap();
-        proc.send_line("Hello\n\n \nlocalhost\n").unwrap();
-        thread::sleep(time::Duration::from_millis(100));
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello");
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "");
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), " ");
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "localhost");
-        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
-
-        assert!(proc.error_bytes().unwrap().is_empty());
-        assert!(proc.wait().unwrap());
-    }
-
+    /// Check it can get the last line before an EOF
     #[test]
     fn eof_line() {
-        // Check it can get the last line before an EOF
-        let comp = dbg!(Arc::new(Computer::Local));
-        let mut proc = dbg!(comp.exec(&["echo", "one\ntwo\nthree"])).unwrap();
-        thread::sleep(time::Duration::from_millis(100));
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "one");
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "two");
-        assert!(proc.is_alive().unwrap());
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "three");
-        assert!(dbg!(proc.recv_line()).is_err());
-        assert!(!proc.is_alive().unwrap());
-        assert!(proc.wait().unwrap());
+        for comp in computer_test_assets() {
+            dbg!(&comp);
+            let mut proc = dbg!(comp.exec(&["echo", "-e", "one\ntwo \nthree"]).unwrap());
+            thread::sleep(time::Duration::from_millis(100));
+            assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "one");
+            assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "two ");
+            assert!(proc.is_alive().unwrap());
+            assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "three");
+            assert!(dbg!(proc.recv_line()).is_err());
+            assert!(!proc.is_alive().unwrap());
+            assert!(proc.wait().unwrap());
+        }
     }
 
     #[test]
     fn is_alive() {
-        let comp = dbg!(Arc::new(Computer::Local));
-        let mut proc = dbg!(comp.exec(&["sleep", ".3"])).unwrap();
-        thread::sleep(time::Duration::from_millis(100));
-        assert!(proc.is_alive().unwrap());
-        proc.close_stdio().unwrap();
-        thread::sleep(time::Duration::from_millis(100));
-        assert!(proc.is_alive().unwrap());
-        proc.wait().unwrap();
-        assert!(!proc.is_alive().unwrap());
-    }
-
-    #[test]
-    fn remote_ack() {
-        // First SCP the environment files onto the remote test computer.
-        let (_server, comp) = dbg!(remote_computer_test_asset());
-        let mut proc = dbg!(Arc::new(comp).exec(&["cat".to_string(), "-".to_string()])).unwrap();
-        assert!(proc.is_alive().unwrap());
-
-        thread::sleep(time::Duration::from_millis(100));
-
-        // No data yet, should instantly yield (non-blocking).
-        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
-        assert!(proc.is_alive().unwrap());
-
-        // Send a message. Environment should echo it back to stdout.
-        proc.send_line("Hello remote").unwrap();
-        assert!(proc.is_alive().unwrap());
-        thread::sleep(time::Duration::from_millis(100));
-        assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello remote");
-        assert!(proc.is_alive().unwrap());
-
-        // Message consumed, no further messages.
-        assert!(matches!(dbg!(proc.recv_line()), Ok(None)));
-        assert!(proc.is_alive().unwrap());
-
-        assert!(proc.error_bytes().unwrap().is_empty());
-        assert!(proc.is_alive().unwrap());
-        proc.close_stdio().unwrap();
-        assert!(proc.is_alive().unwrap());
-        assert!(proc.wait().unwrap());
-        assert!(!proc.is_alive().unwrap());
+        for comp in computer_test_assets() {
+            dbg!(&comp);
+            let mut proc = dbg!(comp.exec(&["sleep", ".5"]).unwrap());
+            // Check that stderr forwarding does not interfere with blocking/non-blocking
+            let fwd = Forwarder::new(Box::new(io::stderr()));
+            fwd.forward_stderr(&mut proc).unwrap();
+            thread::sleep(time::Duration::from_millis(100));
+            // Poll the sleeping process's status
+            for _ in 0..100 {
+                assert!(proc.is_alive().unwrap());
+            }
+            // Close stdio, should not affect process
+            proc.close_stdio().unwrap();
+            thread::sleep(time::Duration::from_millis(100));
+            for _ in 0..100 {
+                assert!(proc.is_alive().unwrap());
+            }
+            // Check repeated calls to wait() & is_alive() yield consistent results after death
+            for _ in 0..10 {
+                assert!(proc.wait().unwrap());
+                assert!(!proc.is_alive().unwrap());
+            }
+            assert!(!proc.is_alive().unwrap());
+        }
     }
 
     /// Test sending and receiving files.
     #[test]
-    fn remote_roundtrip() {
-        let (_server, comp) = dbg!(remote_computer_test_asset());
+    #[ignore]
+    fn file_roundtrip() {
+        // This testcase does not work. The problem is that there is only one
+        // file system, and send & recv files only accepts one file-path,
+        // which serves as both source and destination. Therefore it's
+        // impossible to send/recv files with localhost w/o overwriting.
+        // This might be a bit of an API flaw...
+
         // Make a new local directory.
-        let dir_name = PathBuf::from("test_dir");
+        let dir_name = temp_dir().join("process_anywhere_file_roundtrip");
         fs::create_dir_all(&dir_name).unwrap();
 
         // Make a new local file.
@@ -1286,9 +1324,10 @@ Subsystem sftp internal-sftp
         fs::write(&file_name, &file_data).unwrap();
 
         // Send it to the remote test computer.
+        let comp = remote_publickey_computer();
         comp.send_file(&file_name).unwrap();
 
-        // Delete the local copy of the file.
+        // Delete the local copy of the file & directory.
         fs::remove_file(&file_name).unwrap();
         fs::remove_dir(&dir_name).unwrap();
 
@@ -1307,62 +1346,114 @@ Subsystem sftp internal-sftp
     // Test forwarding stderr to the console. This should print "Hello World!"
     // to the console three times.
     #[test]
-    fn forwarder_usage() {
-        const EPRINT: &str = "import sys; print('Hello World!', file=sys.stderr, flush=True);";
-        const SLEEP: &str = "import time; time.sleep(.2);";
+    fn forwarder() {
+        let log_file = temp_dir().join("process_anywhere_stderr_test");
+        if log_file.exists() {
+            fs::remove_file(&log_file).unwrap();
+        }
+        let log = fs::File::create(&log_file).unwrap();
+        let fwd = Forwarder::new(Box::new(log));
+        const EPRINT: &str = "import sys; print('TEST', file=sys.stderr, flush=True);";
+        const SLEEP: &str = "import time; time.sleep(1);";
         let prog1 = format!("{EPRINT}{SLEEP}");
         let prog2 = format!("{SLEEP}{EPRINT}");
-        let mut proc1 = Arc::new(Computer::Local)
-            .exec(&["python", "-c", &prog1])
-            .unwrap();
-        let fwd = Forwarder::new(Box::new(io::stderr()));
-        fwd.forward_stderr(&mut proc1).unwrap();
-        thread::sleep(time::Duration::from_millis(100));
+        // Run prog1 on all computers
+        let mut proc1 = vec![];
+        for comp in computer_test_assets() {
+            let mut proc = comp.clone().exec(&["python3", "-c", &prog1]).unwrap();
+            fwd.forward_stderr(&mut proc).unwrap();
+            proc1.push(proc);
+        }
+        //
+        thread::sleep(time::Duration::from_millis(500));
         // Check that processes can be added to the forwarder at any time
-        let mut proc2 = Arc::new(Computer::Local)
-            .exec(&["python", "-c", &prog2])
-            .unwrap();
-        let mut proc3 = Arc::new(Computer::Local)
-            .exec(&["python", "-c", &prog2])
-            .unwrap();
-        proc3.close_stdio().unwrap();
-        fwd.forward_stderr(&mut proc2).unwrap();
-        fwd.forward_stderr(&mut proc3).unwrap();
+        let mut proc2 = vec![];
+        for comp in computer_test_assets() {
+            let mut proc = comp.clone().exec(&["python3", "-c", &prog2]).unwrap();
+            fwd.forward_stderr(&mut proc).unwrap();
+            proc2.push(proc);
+        }
+        let mut proc3 = vec![];
+        for comp in computer_test_assets() {
+            let mut proc = comp.clone().exec(&["python3", "-c", &prog2]).unwrap();
+            proc.close_stdio().unwrap(); // test forward stderr w/ closed stdin & stdout
+            fwd.forward_stderr(&mut proc).unwrap();
+            proc3.push(proc)
+        }
         // Check forwarder remains active for proc2 and proc3 after proc1 terminates
-        proc1.wait().unwrap();
-        assert!(!proc1.is_alive().unwrap());
-        assert!(proc2.is_alive().unwrap());
-        assert!(proc3.is_alive().unwrap());
-        thread::sleep(time::Duration::from_millis(200));
-        assert!(!proc2.is_alive().unwrap());
-        assert!(!proc3.is_alive().unwrap());
+        for proc in &mut proc1 {
+            assert!(proc.wait().unwrap());
+            assert!(!proc.is_alive().unwrap());
+        }
+        for proc in &mut proc2 {
+            assert!(proc.is_alive().unwrap());
+        }
+        for proc in &mut proc3 {
+            assert!(proc.is_alive().unwrap());
+        }
+        // Wait for all processes to exit
+        for proc in &mut proc2 {
+            assert!(proc.wait().unwrap());
+        }
+        for proc in &mut proc3 {
+            assert!(proc.wait().unwrap());
+        }
+        // Wait and check that forwarder collected remaining data
+        thread::sleep(time::Duration::from_millis(500));
+        for proc in &mut proc2 {
+            assert!(!proc.is_alive().unwrap());
+        }
+        for proc in &mut proc3 {
+            assert!(!proc.is_alive().unwrap());
+        }
+        // Check the stderr log
+        mem::drop(fwd);
+        let stderr_log = fs::read(log_file).unwrap();
+        let stderr_log = String::from_utf8(stderr_log).unwrap();
+        dbg!(&stderr_log);
+        let lines: Vec<&str> = stderr_log.lines().collect();
+        assert!(lines.len() == 3 * proc1.len());
+        assert!(lines.iter().all(|x| *x == "TEST"));
     }
 
     // Check all blocking calls, and check that forwarder does not interfere
     #[test]
     fn blocking() {
-        const PROG: &str = "import sys; import time;
-time.sleep(.2);
-print('hello', flush=True);
-sys.stdout.buffer.write(b'world!');
-1/0";
-        let mut proc = Arc::new(Computer::Local)
-            .exec(&["python", "-c", PROG])
-            .unwrap();
+        const PROGRAM: &str = "import sys; import time;
+time.sleep(1)
+print('hello', flush=True)
+sys.stdout.buffer.write(b'world!')
+sys.stdout.flush()
+exit(0)";
+        let mut processes: Vec<Box<Process>> = computer_test_assets()
+            .iter()
+            .map(|comp| comp.clone().exec(&["python3", "-c", PROGRAM]).unwrap())
+            .collect();
+        //
+        let fwd = Forwarder::new(Box::new(io::stderr()));
+        for proc in &mut processes {
+            fwd.forward_stderr(proc).unwrap();
+        }
+        thread::sleep(time::Duration::from_millis(500));
         // Check non-blocking before results are ready.
-        assert!(dbg!(proc.error_bytes()).unwrap().is_empty());
-        assert!(dbg!(proc.recv_line().unwrap()).is_none());
-        assert!(dbg!(proc.recv_bytes(6).unwrap()).is_none());
+        for proc in &mut processes {
+            for _ in 0..1000 {
+                assert!(proc.recv_line().unwrap().is_none());
+                assert!(proc.recv_bytes(1).unwrap().is_none());
+                assert!(proc.recv_bytes(0).unwrap() == Some(Box::new([])));
+            }
+        }
         // Wait for results.
-        assert_eq!(proc.block_line().unwrap(), "hello");
-        assert_eq!(proc.block_bytes(6).unwrap(), (*b"world!").into());
-        assert!(!dbg!(proc.error_bytes()).unwrap().is_empty()); // div zero error
-        assert!(dbg!(proc.recv_line().unwrap()).is_none()); // non-blocking still works
-        assert!(dbg!(proc.recv_bytes(1).unwrap()).is_none());
-        assert!(!proc.wait().unwrap()); // error code at exit
-        // Check all blocking
-        // calls: "send_line", "send_bytes", "block_line", "block_bytes",
-        // and "is_alive".
-        // todo!();
+        for proc in &mut processes {
+            assert_eq!(proc.block_line().unwrap(), "hello");
+            assert_eq!(proc.block_bytes(6).unwrap(), (*b"world!").into());
+            assert!(proc.wait().unwrap());
+            assert!(!proc.is_alive().unwrap());
+            // Check all call now yield EOF
+            assert!(proc.recv_line().unwrap_err().eof());
+            assert!(proc.recv_bytes(1).unwrap_err().eof());
+            assert!(proc.block_line().unwrap_err().eof());
+            assert!(proc.block_bytes(1).unwrap_err().eof());
+        }
     }
 }
