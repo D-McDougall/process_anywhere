@@ -923,11 +923,12 @@ fn guard_session_blocking(nonblocking: &Mutex<u8>) -> MutexGuard<'_, u8> {
     }
 }
 
-/// Forward standard error stream
+/// Forward process standard error streams in background thread
 ///
-/// This starts a new thread ... which dies when this object is dropped
-///
-/// TODO DOCS
+/// This spawns a new thread that reads stderr from processes and writes to an
+/// output `io::Write` implementation. Stderr is read in non-blocking mode.
+/// Each thread accepts multiple process. The background thread exits when
+/// this object is dropped.
 pub struct Forwarder {
     tx: mpsc::Sender<StderrMessage>,
 }
@@ -941,6 +942,7 @@ enum StderrMessage {
     },
 }
 impl Forwarder {
+    /// Spawn a new thread that forwards stderr messages to the given writer
     pub fn new(destination: Box<dyn Write + Send>) -> Self {
         let (tx, rx) = mpsc::channel();
         thread::spawn(|| Self::main(rx, destination));
