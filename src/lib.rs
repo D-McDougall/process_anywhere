@@ -5,8 +5,6 @@
 //      * interacting with a remote process
 //      * file transfers
 
-// TODO: Document UTF8 is required for all text IO
-
 #![allow(clippy::uninit_vec)]
 #![allow(unreachable_code)]
 
@@ -995,59 +993,62 @@ impl Forwarder {
             // Check for new stderr channels
             match rx.try_recv() {
                 Ok(message) => sources.push(message),
-                Err(TryRecvError::Empty) => {
-                    if sources.is_empty() {
-                        thread::yield_now();
-                    }
-                }
+                Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => break,
             }
             // Check each stderr channel. Exhaust each channel before moving
             // onto the next, to minimize interleaving channels.
             for (index, source) in sources.iter_mut().enumerate() {
-                match source {
-                    StderrMessage::Local(stderr) => loop {
-                        match stderr.read(&mut buffer) {
-                            Ok(size) if size > 0 => {
-                                destination.write_all(&buffer[..size]).unwrap();
-                            }
-                            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                                break;
-                            }
-                            _ => {
-                                dead.push(index); // Mark this source for removal
-                                break;
-                            }
+                // Set remote stderr to non-blocking (local is always non-blocking)
+                if let StderrMessage::Remote {
+                    session,
+                    nonblocking,
+                    ..
+                } = source
+                {
+                    set_session_nonblocking(session, nonblocking);
+                }
+                //
+                let stderr: &mut dyn io::Read = match source {
+                    StderrMessage::Local(stderr) => stderr,
+                    StderrMessage::Remote { stderr, .. } => stderr,
+                };
+                // Read stderr until exhausted
+                let mut destination_writen = false;
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(size) if size > 0 => {
+                            destination.write_all(&buffer[..size]).unwrap();
+                            destination_writen = true;
                         }
-                    },
-                    StderrMessage::Remote {
-                        session,
-                        stderr,
-                        nonblocking,
-                    } => {
-                        set_session_nonblocking(session, nonblocking);
-                        loop {
-                            match stderr.read(&mut buffer) {
-                                Ok(size) if size > 0 => {
-                                    destination.write_all(&buffer[..size]).unwrap();
-                                }
-                                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                                    break;
-                                }
-                                _ => {
-                                    dead.push(index); // Mark this source for removal
-                                    break;
-                                }
-                            }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            break;
                         }
-                        set_session_blocking(session, nonblocking);
+                        _ => {
+                            dead.push(index); // Mark this source for removal
+                            break;
+                        }
                     }
+                }
+                if destination_writen {
+                    destination.flush().unwrap();
+                }
+                // Restore stderr to blocking mode
+                if let StderrMessage::Remote {
+                    session,
+                    nonblocking,
+                    ..
+                } = source
+                {
+                    set_session_blocking(session, nonblocking);
                 }
             }
             // Remove closed channels from the sources list
             for index in mem::take(&mut dead).iter().rev() {
                 sources.swap_remove(*index);
             }
+            // Sleep thread in background, poll every 10 ms
+            thread::sleep(time::Duration::from_millis(10));
         }
     }
 }
@@ -1055,13 +1056,25 @@ impl Forwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env::temp_dir;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::sync::OnceLock;
 
+    fn temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push("process_anywhere");
+        if !dir.exists() {
+            fs::create_dir(&dir).unwrap();
+        }
+        dir
+    }
+
     /// Every test is evaluated on every computer
     fn computer_test_assets() -> Vec<Arc<Computer>> {
-        vec![Computer::new_local(), remote_publickey_computer()]
+        vec![
+            //
+            Computer::new_local(),
+            remote_publickey_computer(),
+        ]
     }
 
     /// Start an SSH server using public-key authentication
@@ -1093,7 +1106,7 @@ mod tests {
     }
     impl SshKeyFiles {
         fn new() -> Self {
-            let base_dir = temp_dir().join("process_anywhere_test");
+            let base_dir = temp_dir().join("test_keys");
             if !base_dir.exists() {
                 fs::create_dir(&base_dir).unwrap();
             }
@@ -1118,7 +1131,7 @@ mod tests {
         fn generate(&mut self) {
             self.delete();
             for path in [&self.server_private, &self.client_private] {
-                Command::new("ssh-keygen")
+                let status = Command::new("ssh-keygen")
                     .args([
                         "-t",
                         "ed25519",
@@ -1129,6 +1142,7 @@ mod tests {
                     ])
                     .status()
                     .unwrap();
+                assert!(status.success());
             }
         }
     }
@@ -1333,7 +1347,7 @@ exit(1)"
         // This might be a bit of an API flaw...
 
         // Make a new local directory.
-        let dir_name = temp_dir().join("process_anywhere_file_roundtrip");
+        let dir_name = temp_dir().join("file_roundtrip");
         fs::create_dir_all(&dir_name).unwrap();
 
         // Make a new local file.
@@ -1361,11 +1375,10 @@ exit(1)"
         assert_eq!(file_data, roundtrip);
     }
 
-    // Test forwarding stderr to the console. This should print "Hello World!"
-    // to the console three times.
+    // Test forwarding stderr to the console
     #[test]
     fn forwarder() {
-        let log_file = temp_dir().join("process_anywhere_stderr_test");
+        let log_file = temp_dir().join("stderr_test");
         if log_file.exists() {
             fs::remove_file(&log_file).unwrap();
         }
@@ -1430,7 +1443,7 @@ exit(1)"
         let stderr_log = String::from_utf8(stderr_log).unwrap();
         dbg!(&stderr_log);
         let lines: Vec<&str> = stderr_log.lines().collect();
-        assert!(lines.len() == 3 * proc1.len());
+        assert!(lines.len() == 3 * proc3.len());
         assert!(lines.iter().all(|x| *x == "TEST"));
     }
 
@@ -1472,6 +1485,47 @@ exit(0)";
             assert!(proc.recv_bytes(1).unwrap_err().eof());
             assert!(proc.block_line().unwrap_err().eof());
             assert!(proc.block_bytes(1).unwrap_err().eof());
+        }
+    }
+
+    /// Check that Forwarder catches panic messages
+    #[test]
+    fn panic() {
+        // Build a program that panics
+        const PROGRAM: &str = "fn main() { panic!(\"HELLO PANIC!\"); }";
+        let source_path = temp_dir().join("panic.rs");
+        let binary_path = temp_dir().join("panic");
+        let binary_path_string = binary_path.into_os_string().into_string().unwrap();
+        fs::write(&source_path, PROGRAM).unwrap();
+        assert!(
+            Command::new("rustc")
+                .arg("-o")
+                .arg(&binary_path_string)
+                .arg(&source_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for comp in computer_test_assets() {
+            dbg!(&comp);
+            // Setup a temp file to forward stderr to
+            let stderr_path = temp_dir().join("panic_log.txt");
+            let stderr_file = fs::File::create(&stderr_path).unwrap();
+            // Run the panic program and capture its stderr
+            let mut proc = comp.exec(&[&binary_path_string]).unwrap();
+            let fwd = Forwarder::new(Box::new(stderr_file));
+            fwd.forward_stderr(&mut proc).unwrap();
+            // Wait for program crash
+            assert!(!proc.wait().unwrap());
+            // Wait for forwarder thread to catch up (it has a 10 ms polling period)
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            mem::drop(fwd);
+            // Check for the panic message
+            let message = fs::read_to_string(&stderr_path).unwrap();
+            dbg!(&message);
+            assert!(!proc.is_alive().unwrap());
+            assert!(message.contains("HELLO PANIC!"));
+            fs::remove_file(stderr_path).unwrap();
         }
     }
 }
