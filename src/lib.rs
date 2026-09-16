@@ -18,7 +18,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::mem;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::{self, fd::AsRawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc, mpsc::TryRecvError};
 use std::thread;
@@ -53,8 +53,11 @@ pub enum Computer {
         /// Login username
         user: String,
 
-        /// User authentication password / key
+        /// User authentication password
         auth: String,
+
+        /// Client's private key file
+        key: PathBuf,
     },
 }
 
@@ -64,13 +67,15 @@ impl Computer {
         Self::Local.into()
     }
     /// Token for accessing a computer remotely over SSH
-    pub fn new_remote(host: String, user: String, auth: String) -> Result<Arc<Self>, Error> {
+    pub fn new_remote(host: String, user: String, key: PathBuf) -> Result<Arc<Self>, Error> {
         let addr = host.to_socket_addrs()?.next().unwrap();
+        let auth = String::new();
         Ok(Self::Remote {
             host,
             addr,
             user,
             auth,
+            key,
         }
         .into())
     }
@@ -78,7 +83,11 @@ impl Computer {
     fn connect(&self) -> Result<Session, Error> {
         // Unpack the remote computer's information into local variables
         let Self::Remote {
-            addr, user, auth, ..
+            addr,
+            user,
+            auth,
+            key,
+            ..
         } = self
         else {
             unreachable!();
@@ -88,7 +97,11 @@ impl Computer {
         let mut conn = Session::new()?;
         conn.set_tcp_stream(tcp);
         conn.handshake()?;
-        conn.userauth_password(user, auth)?;
+        if key != &PathBuf::new() {
+            conn.userauth_pubkey_file(user, None, &key, None)?;
+        } else if !auth.is_empty() {
+            conn.userauth_password(user, auth)?;
+        }
         Ok(conn)
     }
     /// Zero the authentication token / password out of memory
@@ -248,6 +261,7 @@ impl fmt::Debug for Computer {
                 addr,
                 user,
                 auth,
+                key,
             } => {
                 let auth = if auth.is_empty() {
                     format_args!("\"\"")
@@ -259,6 +273,7 @@ impl fmt::Debug for Computer {
                     .field("addr", &addr)
                     .field("user", &user)
                     .field("auth", &auth)
+                    .field("key", &key)
                     .finish()
             }
         }
@@ -1042,7 +1057,6 @@ mod tests {
     use super::*;
     use std::env::temp_dir;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
-    use std::path::PathBuf;
     use std::sync::OnceLock;
 
     /// Every test is evaluated on every computer
@@ -1060,7 +1074,8 @@ mod tests {
                 host: String::new(),
                 addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
                 user: "dm".to_string(),
-                auth: keys.client_private.into_os_string().into_string().unwrap(),
+                auth: String::new(),
+                key: keys.client_private.clone(),
             });
             (server, computer)
         });
@@ -1182,6 +1197,7 @@ Subsystem sftp internal-sftp
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234),
             user: "unit_test".to_string(),
             auth: "Z".to_string(),
+            key: PathBuf::new(),
         };
 
         let debug = format!("{comp1:?}\n{comp2:?}");
