@@ -12,6 +12,9 @@
 [lib]
     doctest = false
 
+[features]
+    vendored-openssl = ["ssh2/vendored-openssl"]
+
 [dependencies]
     libc = "0.2"
     shell-escape = "0.1"
