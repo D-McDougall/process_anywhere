@@ -16,11 +16,12 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::mem;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::{self, fd::AsRawFd};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc, mpsc::TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, mpsc, mpsc::TryRecvError};
 use std::thread;
-use std::time;
+use std::time::{self, Duration};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -943,10 +944,10 @@ fn guard_session_blocking(nonblocking: &Mutex<u8>) -> MutexGuard<'_, u8> {
 /// Each thread accepts multiple process. The background thread exits when
 /// this object is dropped.
 pub struct Forwarder {
-    tx: mpsc::Sender<StderrMessage>,
+    tx: mpsc::Sender<StderrInfo>,
 }
 // Structure of messages sent to the worker thread
-enum StderrMessage {
+enum StderrInfo {
     Local(ChildStderr),
     Remote {
         session: Session,
@@ -957,6 +958,7 @@ enum StderrMessage {
 impl Forwarder {
     /// Spawn a new thread that forwards stderr messages to the given writer
     pub fn new(destination: Box<dyn Write + Send>) -> Self {
+        install_panic_handler();
         let (tx, rx) = mpsc::channel();
         thread::spawn(|| Self::main(rx, destination));
         Self { tx }
@@ -969,14 +971,14 @@ impl Forwarder {
     /// process.
     pub fn forward_stderr(&self, process: &mut Process) -> Result<(), Error> {
         let message = match &mut process.inner {
-            ProcessInner::Local(child) => StderrMessage::Local(
-                mem::take(&mut child.stderr).expect("stderr already forwarded"),
-            ),
+            ProcessInner::Local(child) => {
+                StderrInfo::Local(mem::take(&mut child.stderr).expect("stderr already forwarded"))
+            }
             ProcessInner::Remote(RemoteInner {
                 session,
                 channel,
                 nonblocking,
-            }) => StderrMessage::Remote {
+            }) => StderrInfo::Remote {
                 session: session.clone(),
                 stderr: channel.stderr(),
                 nonblocking: nonblocking.clone(),
@@ -985,22 +987,25 @@ impl Forwarder {
         self.tx.send(message).expect("stderr thread crashed");
         Ok(())
     }
-    fn main(rx: mpsc::Receiver<StderrMessage>, mut destination: Box<dyn Write>) {
+    fn main(rx: mpsc::Receiver<StderrInfo>, mut destination: Box<dyn Write>) {
         let mut sources = vec![];
         let mut dead = vec![];
         let mut buffer = [0u8; BUFFER_SIZE];
+        let mut quit = false;
         loop {
             // Check for new stderr channels
             match rx.try_recv() {
                 Ok(message) => sources.push(message),
                 Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => {
+                    quit = true;
+                }
             }
             // Check each stderr channel. Exhaust each channel before moving
             // onto the next, to minimize interleaving channels.
             for (index, source) in sources.iter_mut().enumerate() {
                 // Set remote stderr to non-blocking (local is always non-blocking)
-                if let StderrMessage::Remote {
+                if let StderrInfo::Remote {
                     session,
                     nonblocking,
                     ..
@@ -1010,8 +1015,8 @@ impl Forwarder {
                 }
                 //
                 let stderr: &mut dyn io::Read = match source {
-                    StderrMessage::Local(stderr) => stderr,
-                    StderrMessage::Remote { stderr, .. } => stderr,
+                    StderrInfo::Local(stderr) => stderr,
+                    StderrInfo::Remote { stderr, .. } => stderr,
                 };
                 // Read stderr until exhausted
                 let mut destination_writen = false;
@@ -1034,7 +1039,7 @@ impl Forwarder {
                     destination.flush().unwrap();
                 }
                 // Restore stderr to blocking mode
-                if let StderrMessage::Remote {
+                if let StderrInfo::Remote {
                     session,
                     nonblocking,
                     ..
@@ -1043,15 +1048,43 @@ impl Forwarder {
                     set_session_blocking(session, nonblocking);
                 }
             }
+            if quit {
+                break;
+            }
             // Remove closed channels from the sources list
             for index in mem::take(&mut dead).iter().rev() {
                 sources.swap_remove(*index);
             }
             // Sleep thread in background, poll every 10 ms
-            thread::sleep(time::Duration::from_millis(10));
+            let timeout = Duration::from_millis(10);
+            let mutex = Mutex::new(());
+            let guard = mutex.lock().unwrap();
+            let _ = SLEEP.wait_timeout(guard, timeout).unwrap();
         }
     }
 }
+/// Global singleton, used by custom panic handler to wake up all Forwarders
+static SLEEP: Condvar = Condvar::new();
+/// Install a custom panic handler, which wakes the Forwarder's background
+/// thread to collect stderr before process termination.
+fn install_panic_handler() {
+    INSTALLED.call_once(|| {
+        let default_panic = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            // Wake up background threads twice with a short delay in between,
+            // to avoid race conditions
+            SLEEP.notify_all();
+            std::thread::sleep(Duration::from_micros(100));
+            SLEEP.notify_all();
+            // Pause the stack from unwinding to ensure that Forwarders run
+            // before the process terminates
+            std::thread::sleep(Duration::from_millis(1));
+            default_panic(info);
+        }));
+    });
+}
+/// Flag to ensure panic handler is installed at most once
+static INSTALLED: Once = Once::new();
 
 #[cfg(test)]
 mod tests {
@@ -1198,7 +1231,7 @@ Subsystem sftp internal-sftp
             ])
             .spawn()
             .unwrap();
-        thread::sleep(time::Duration::from_millis(250)); // Wait for server startup
+        thread::sleep(Duration::from_millis(250)); // Wait for server startup
         (server, port)
     }
 
@@ -1231,7 +1264,7 @@ Subsystem sftp internal-sftp
 
             // Send a message. Process should echo it back to stdout.
             proc.send_line("Hello World!").unwrap();
-            thread::sleep(time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
             assert_eq!(dbg!(proc.recv_line()).unwrap().unwrap(), "Hello World!");
 
             // Message consumed, no further messages.
@@ -1239,7 +1272,7 @@ Subsystem sftp internal-sftp
 
             // Test newline handling
             proc.send_line("Hello\n\n \nlocalhost\n").unwrap();
-            thread::sleep(time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
             assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "Hello");
             assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "");
             assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), " ");
@@ -1270,7 +1303,7 @@ exit(1)"
                 ])
                 .unwrap()
             );
-            thread::sleep(time::Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(500));
             // Check process is kept "alive" by buffered & uncollected data
             assert!(proc.is_alive().unwrap());
             dbg!();
@@ -1297,7 +1330,7 @@ exit(1)"
         for comp in computer_test_assets() {
             dbg!(&comp);
             let mut proc = dbg!(comp.exec(&["echo", "-e", "one\ntwo \nthree"]).unwrap());
-            thread::sleep(time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
             assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "one");
             assert_eq!(dbg!(proc.recv_line().unwrap()).unwrap(), "two ");
             assert!(proc.is_alive().unwrap());
@@ -1316,14 +1349,14 @@ exit(1)"
             // Check that stderr forwarding does not interfere with blocking/non-blocking
             let fwd = Forwarder::new(Box::new(io::stderr()));
             fwd.forward_stderr(&mut proc).unwrap();
-            thread::sleep(time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
             // Poll the sleeping process's status
             for _ in 0..100 {
                 assert!(proc.is_alive().unwrap());
             }
             // Close stdio, should not affect process
             proc.close_stdio().unwrap();
-            thread::sleep(time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
             for _ in 0..100 {
                 assert!(proc.is_alive().unwrap());
             }
@@ -1396,7 +1429,7 @@ exit(1)"
             proc1.push(proc);
         }
         //
-        thread::sleep(time::Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(500));
         // Check that processes can be added to the forwarder at any time
         let mut proc2 = vec![];
         for comp in computer_test_assets() {
@@ -1430,7 +1463,7 @@ exit(1)"
             assert!(proc.wait().unwrap());
         }
         // Wait and check that forwarder collected remaining data
-        thread::sleep(time::Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(500));
         for proc in &mut proc2 {
             assert!(!proc.is_alive().unwrap());
         }
@@ -1465,7 +1498,7 @@ exit(0)";
         for proc in &mut processes {
             fwd.forward_stderr(proc).unwrap();
         }
-        thread::sleep(time::Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(500));
         // Check non-blocking before results are ready.
         for proc in &mut processes {
             for _ in 0..1000 {
@@ -1488,7 +1521,8 @@ exit(0)";
         }
     }
 
-    /// Check that Forwarder catches panic messages
+    /// Check that Forwarder catches panic messages, even when the main thread
+    /// immediately panics too
     #[test]
     fn panic() {
         // Build a program that panics
@@ -1511,19 +1545,19 @@ exit(0)";
             // Setup a temp file to forward stderr to
             let stderr_path = temp_dir().join("panic_log.txt");
             let stderr_file = fs::File::create(&stderr_path).unwrap();
-            // Run the panic program and capture its stderr
-            let mut proc = comp.exec(&[&binary_path_string]).unwrap();
-            let fwd = Forwarder::new(Box::new(stderr_file));
-            fwd.forward_stderr(&mut proc).unwrap();
-            // Wait for program crash
-            assert!(!proc.wait().unwrap());
-            // Wait for forwarder thread to catch up (it has a 10 ms polling period)
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            mem::drop(fwd);
+            //
+            let result = panic::catch_unwind(|| {
+                // Run the panic program and capture its stderr
+                let mut proc = comp.exec(&[&binary_path_string]).unwrap();
+                let fwd = Forwarder::new(Box::new(stderr_file));
+                fwd.forward_stderr(&mut proc).unwrap();
+                // Wait for program crash, and propagate the panic
+                assert!(proc.wait().unwrap());
+            });
+            assert!(result.is_err());
             // Check for the panic message
             let message = fs::read_to_string(&stderr_path).unwrap();
             dbg!(&message);
-            assert!(!proc.is_alive().unwrap());
             assert!(message.contains("HELLO PANIC!"));
             fs::remove_file(stderr_path).unwrap();
         }
