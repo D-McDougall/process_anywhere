@@ -316,8 +316,7 @@ impl Error {
 /// each line.
 ///
 /// ## Blocking
-///  * Writing to the process’s stdin is always blocking, and also immediately
-///    flushes to operating system buffer
+///  * Writing to the process’s stdin is always blocking
 ///  * Reading from the process’s stdout can be either blocking or non-blocking
 ///  * Reading from the process’s stderr is always non-blocking
 ///
@@ -547,7 +546,7 @@ impl Process {
             }
         }
     }
-    /// Write to and flush the process’s standard input channel.
+    /// Write to and flush the process’s standard input channel.  
     /// This appends a newline (if not already present).
     ///
     /// **Blocks** the calling thread until this operation is completed
@@ -572,7 +571,7 @@ impl Process {
         }
         Ok(())
     }
-    /// Write to and flush the process’s standard input channel.
+    /// Write to and flush the process’s standard input channel
     ///
     /// **Blocks** the calling thread until this operation is completed
     pub fn send_bytes(&mut self, message: &[u8]) -> Result<(), Error> {
@@ -590,7 +589,62 @@ impl Process {
         }
         Ok(())
     }
-    /// Read zero or one lines from the process’s standard output channel.
+    /// Write to the process’s standard input buffer without flushing.  
+    /// This appends a newline (if not already present).
+    ///
+    /// **Blocks** if all buffers are full. This never drops data
+    pub fn buffer_line(&mut self, message: &str) -> Result<(), Error> {
+        match self.inner {
+            ProcessInner::Local(_) => {
+                let stdin = self.stdin()?;
+                stdin.write_all(message.as_bytes())?;
+                if !message.ends_with('\n') {
+                    stdin.write_all(b"\n")?;
+                }
+            }
+            ProcessInner::Remote(_) => {
+                let stdin = self.stdin()?;
+                blocking_loop(|| stdin.write_all(message.as_bytes()))?;
+                if !message.ends_with('\n') {
+                    blocking_loop(|| stdin.write_all(b"\n"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Write to the process’s standard input buffer without flushing
+    ///
+    /// **Blocks** if all buffers are full. This never drops data
+    pub fn buffer_bytes(&mut self, message: &[u8]) -> Result<(), Error> {
+        match self.inner {
+            ProcessInner::Local(_) => {
+                let stdin = self.stdin()?;
+                stdin.write_all(message)?;
+            }
+            ProcessInner::Remote(_) => {
+                let stdin = self.stdin()?;
+                blocking_loop(|| stdin.write_all(message))?;
+            }
+        }
+        Ok(())
+    }
+    /// Flush the process’s standard input buffer
+    ///
+    /// **Blocks** the calling thread until this operation is completed
+    pub fn flush_stdin(&mut self) -> Result<(), Error> {
+        match self.inner {
+            ProcessInner::Local(_) => {
+                let stdin = self.stdin()?;
+                stdin.flush()?;
+            }
+            ProcessInner::Remote(_) => {
+                let stdin = self.stdin()?;
+                blocking_loop(|| stdin.flush())?;
+            }
+        }
+        Ok(())
+    }
+    /// Read zero or one lines from the process’s standard output channel.  
     /// Then this removes the trailing newline.
     ///
     /// **Non-blocking:** returns [None] if a line is not yet available
@@ -639,7 +693,7 @@ impl Process {
         self.stdout_buffer.append(&mut chunk?.into());
         Ok(())
     }
-    /// Read one line from the process’s standard output channel.
+    /// Read one line from the process’s standard output channel.  
     /// Then this removes the trailing newline.
     ///
     /// **Blocks** the calling thread until this operation is completed
@@ -703,7 +757,7 @@ impl Process {
         blocking_loop(|| stdout.read_exact(&mut buffer[len..]))?;
         Ok(buffer.into())
     }
-    /// Read one line from the process’s standard error channel.
+    /// Read one line from the process’s standard error channel.  
     /// Then this removes the trailing newline.
     ///
     /// **Non-blocking:** returns [None] if the next line is not yet available
